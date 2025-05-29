@@ -1,7 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![feature(let_chains, linked_list_cursors, os_string_truncate, string_from_utf8_lossy_owned)]
+#![feature(
+    allocator_api,
+    let_chains,
+    linked_list_cursors,
+    os_string_truncate,
+    string_from_utf8_lossy_owned
+)]
 
 mod documents;
 mod draw_editor;
@@ -14,14 +20,14 @@ mod state;
 use std::borrow::Cow;
 #[cfg(feature = "debug-latency")]
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, process};
 
 use draw_editor::*;
 use draw_filepicker::*;
 use draw_menubar::*;
 use draw_statusbar::*;
-use edit::arena::{self, ArenaString, scratch_arena};
+use edit::arena::{self, Arena, ArenaString, scratch_arena};
 use edit::framebuffer::{self, IndexedColor};
 use edit::helpers::{KIBI, MEBI, MetricFormatter, Rect, Size};
 use edit::input::{self, kbmod, vk};
@@ -201,7 +207,7 @@ fn run() -> apperr::Result<()> {
                 );
 
                 // "μs" is 3 bytes and 2 columns.
-                let cols = status.len() as i32 - 3 + 2;
+                let cols = status.len() as edit::helpers::CoordType - 3 + 2;
 
                 // Since the status may shrink and grow, we may have to overwrite the previous one with whitespace.
                 let padding = (last_latency_width - cols).max(0);
@@ -233,11 +239,12 @@ fn run() -> apperr::Result<()> {
 
 // Returns true if the application should exit early.
 fn handle_args(state: &mut State) -> apperr::Result<bool> {
+    let scratch = scratch_arena(None);
+    let mut paths: Vec<PathBuf, &Arena> = Vec::new_in(&*scratch);
     let mut cwd = env::current_dir()?;
-    let mut path = None;
 
     // The best CLI argument parser in the world.
-    if let Some(arg) = env::args_os().nth(1) {
+    for arg in env::args_os().skip(1) {
         if arg == "-h" || arg == "--help" || (cfg!(windows) && arg == "/?") {
             print_help();
             return Ok(true);
@@ -245,15 +252,21 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
             print_version();
             return Ok(true);
         } else if arg == "-" {
-            // We'll check for a redirected stdin no matter what, so we can just ignore "-".
-        } else {
-            let p = cwd.join(Path::new(&arg));
-            let p = path::normalize(&p);
-            if let Some(parent) = p.parent() {
-                cwd = parent.to_path_buf();
-            }
-            path = Some(p);
+            paths.clear();
+            break;
         }
+        let p = cwd.join(Path::new(&arg));
+        let p = path::normalize(&p);
+        if !p.is_dir() {
+            paths.push(p);
+        }
+    }
+
+    for p in &paths {
+        state.documents.add_file_path(p)?;
+    }
+    if let Some(parent) = paths.first().and_then(|p| p.parent()) {
+        cwd = parent.to_path_buf();
     }
 
     if let Some(mut file) = sys::open_stdin_if_redirected() {
@@ -261,13 +274,13 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
         let mut tb = doc.buffer.borrow_mut();
         tb.read_file(&mut file, None)?;
         tb.mark_as_dirty();
-    } else if let Some(path) = path {
-        state.documents.add_file_path(&path)?;
-    } else {
+    } else if paths.is_empty() {
+        // No files were passed, and stdin is not redirected.
         state.documents.add_untitled()?;
     }
 
-    state.file_picker_pending_dir = DisplayablePathBuf::new(cwd);
+    state.file_picker_pending_dir = DisplayablePathBuf::from_path(cwd);
+    state.file_picker_pending_dir_revision = state.file_picker_pending_dir_revision.wrapping_add(1);
     Ok(false)
 }
 
@@ -297,6 +310,9 @@ fn draw(ctx: &mut Context, state: &mut State) {
     }
     if state.wants_exit {
         draw_handle_wants_exit(ctx, state);
+    }
+    if state.wants_goto {
+        draw_goto_menu(ctx, state);
     }
     if state.wants_file_picker != StateFilePicker::None {
         draw_file_picker(ctx, state);
@@ -337,6 +353,8 @@ fn draw(ctx: &mut Context, state: &mut State) {
             state.wants_document_picker = true;
         } else if key == kbmod::CTRL | vk::Q {
             state.wants_exit = true;
+        } else if key == kbmod::CTRL | vk::G {
+            state.wants_goto = true;
         } else if key == kbmod::CTRL | vk::F && state.wants_search.kind != StateSearchKind::Disabled
         {
             state.wants_search.kind = StateSearchKind::Search;
@@ -435,18 +453,18 @@ fn draw_handle_clipboard_change(ctx: &mut Context, state: &mut State) {
             ctx.inherit_focus();
 
             if over_limit {
-                if ctx.button("ok", loc(LocId::Ok)) {
+                if ctx.button("ok", loc(LocId::Ok), ButtonStyle::default()) {
                     state.osc_clipboard_seen_generation = generation;
                 }
                 ctx.inherit_focus();
             } else {
-                if ctx.button("always", loc(LocId::Always)) {
+                if ctx.button("always", loc(LocId::Always), ButtonStyle::default()) {
                     state.osc_clipboard_always_send = true;
                     state.osc_clipboard_seen_generation = generation;
                     state.osc_clipboard_send_generation = generation;
                 }
 
-                if ctx.button("yes", loc(LocId::Yes)) {
+                if ctx.button("yes", loc(LocId::Yes), ButtonStyle::default()) {
                     state.osc_clipboard_seen_generation = generation;
                     state.osc_clipboard_send_generation = generation;
                 }
@@ -454,7 +472,7 @@ fn draw_handle_clipboard_change(ctx: &mut Context, state: &mut State) {
                     ctx.inherit_focus();
                 }
 
-                if ctx.button("no", loc(LocId::No)) {
+                if ctx.button("no", loc(LocId::No), ButtonStyle::default()) {
                     state.osc_clipboard_seen_generation = generation;
                 }
                 if ctx.clipboard().len() >= 10 * LARGE_CLIPBOARD_THRESHOLD {
