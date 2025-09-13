@@ -109,7 +109,6 @@ unsafe fn lines_bwd_avx2(
         }
 
         let lf = _mm256_set1_epi8(b'\n' as i8);
-        let line_stop = line_stop.min(line);
         let off = end.addr() & 31;
         if off != 0 && off < end.offset_from_unsigned(beg) {
             (end, line) = lines_bwd_fallback(end.sub(off), end, line, line_stop);
@@ -193,17 +192,16 @@ unsafe fn lines_bwd_lasx(
 ) -> (*const u8, CoordType) {
     unsafe {
         use std::arch::loongarch64::*;
-        use std::mem::transmute as T;
 
         #[inline(always)]
-        unsafe fn horizontal_sum(sum: v32i8) -> u32 {
+        unsafe fn horizontal_sum(sum: m256i) -> u32 {
             unsafe {
                 let sum = lasx_xvhaddw_h_b(sum, sum);
                 let sum = lasx_xvhaddw_w_h(sum, sum);
                 let sum = lasx_xvhaddw_d_w(sum, sum);
                 let sum = lasx_xvhaddw_q_d(sum, sum);
-                let tmp = lasx_xvpermi_q::<1>(T(sum), T(sum));
-                let sum = lasx_xvadd_w(T(sum), T(tmp));
+                let tmp = lasx_xvpermi_q::<1>(sum, sum);
+                let sum = lasx_xvadd_w(sum, tmp);
                 lasx_xvpickve2gr_wu::<0>(sum)
             }
         }
@@ -244,8 +242,8 @@ unsafe fn lines_bwd_lasx(
             let v = lasx_xvld::<0>(chunk_start as *const _);
             let c = lasx_xvseq_b(v, lf);
 
-            let ones = lasx_xvand_v(T(c), T(lasx_xvrepli_b(1)));
-            let sum = horizontal_sum(T(ones));
+            let ones = lasx_xvand_v(c, lasx_xvrepli_b(1));
+            let sum = horizontal_sum(ones);
 
             let line_next = line - sum as CoordType;
             if line_next <= line_stop {
@@ -270,20 +268,19 @@ unsafe fn lines_bwd_lsx(
 ) -> (*const u8, CoordType) {
     unsafe {
         use std::arch::loongarch64::*;
-        use std::mem::transmute as T;
 
         #[inline(always)]
-        unsafe fn horizontal_sum(sum: v16i8) -> u32 {
+        unsafe fn horizontal_sum(sum: m128i) -> u32 {
             unsafe {
                 let sum = lsx_vhaddw_h_b(sum, sum);
                 let sum = lsx_vhaddw_w_h(sum, sum);
                 let sum = lsx_vhaddw_d_w(sum, sum);
                 let sum = lsx_vhaddw_q_d(sum, sum);
-                lsx_vpickve2gr_wu::<0>(T(sum))
+                lsx_vpickve2gr_wu::<0>(sum)
             }
         }
 
-        let lf = lsx_vrepli_b(b'\n' as i32);
+        const LF: i32 = b'\n' as i32;
         let line_stop = line_stop.min(line);
         let off = end.addr() & 15;
         if off != 0 && off < end.offset_from_unsigned(beg) {
@@ -298,11 +295,11 @@ unsafe fn lines_bwd_lsx(
             let v3 = lsx_vld::<32>(chunk_start as *const _);
             let v4 = lsx_vld::<48>(chunk_start as *const _);
 
-            let mut sum = lsx_vrepli_b(0);
-            sum = lsx_vsub_b(sum, lsx_vseq_b(v1, lf));
-            sum = lsx_vsub_b(sum, lsx_vseq_b(v2, lf));
-            sum = lsx_vsub_b(sum, lsx_vseq_b(v3, lf));
-            sum = lsx_vsub_b(sum, lsx_vseq_b(v4, lf));
+            let mut sum = lsx_vldi::<0>();
+            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v1));
+            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v2));
+            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v3));
+            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v4));
             let sum = horizontal_sum(sum);
 
             let line_next = line - sum as CoordType;
@@ -317,10 +314,10 @@ unsafe fn lines_bwd_lsx(
         while end.offset_from_unsigned(beg) >= 16 {
             let chunk_start = end.sub(16);
             let v = lsx_vld::<0>(chunk_start as *const _);
-            let c = lsx_vseq_b(v, lf);
+            let c = lsx_vseqi_b::<LF>(v);
 
-            let ones = lsx_vand_v(T(c), T(lsx_vrepli_b(1)));
-            let sum = horizontal_sum(T(ones));
+            let ones = lsx_vandi_b::<1>(c);
+            let sum = horizontal_sum(ones);
 
             let line_next = line - sum as CoordType;
             if line_next <= line_stop {
@@ -414,7 +411,7 @@ mod test {
         for _ in 0..1000 {
             let offset = offset_rng() % (text.len() + 1);
             let line_stop = line_distance_rng() % (lines + 1);
-            let line = line_stop + line_rng() % 100;
+            let line = (line_stop + line_rng() % 100).saturating_sub(5);
 
             let line = line as CoordType;
             let line_stop = line_stop as CoordType;
@@ -432,20 +429,19 @@ mod test {
         mut line: CoordType,
         line_stop: CoordType,
     ) -> (usize, CoordType) {
-        if line >= line_stop {
-            while offset > 0 {
-                let c = haystack[offset - 1];
-                if c == b'\n' {
-                    if line == line_stop {
-                        break;
-                    }
-                    line -= 1;
+        while offset > 0 {
+            let c = haystack[offset - 1];
+            if c == b'\n' {
+                if line <= line_stop {
+                    break;
                 }
-                offset -= 1;
+                line -= 1;
             }
+            offset -= 1;
         }
         (offset, line)
     }
+
     #[test]
     fn seeks_to_start() {
         for i in 6..=11 {

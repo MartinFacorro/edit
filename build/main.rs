@@ -1,10 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use core::panic;
-use std::env::VarError;
+#![allow(irrefutable_let_patterns)]
 
-#[derive(PartialEq, Eq)]
+use crate::helpers::env_opt;
+
+mod helpers;
+mod i18n;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TargetOs {
     Windows,
     MacOS,
@@ -17,6 +21,27 @@ fn main() {
         "macos" | "ios" => TargetOs::MacOS,
         _ => TargetOs::Unix,
     };
+
+    compile_i18n();
+    configure_icu(target_os);
+    #[cfg(windows)]
+    configure_windows_binary(target_os);
+}
+
+fn compile_i18n() {
+    const PATH: &str = "i18n/edit.toml";
+
+    let i18n = std::fs::read_to_string(PATH).unwrap();
+    let contents = i18n::generate(&i18n);
+    let out_dir = env_opt("OUT_DIR");
+    let path = format!("{out_dir}/i18n_edit.rs");
+    std::fs::write(path, contents).unwrap();
+
+    println!("cargo::rerun-if-env-changed=EDIT_CFG_LANGUAGES");
+    println!("cargo::rerun-if-changed={PATH}");
+}
+
+fn configure_icu(target_os: TargetOs) {
     let icuuc_soname = env_opt("EDIT_CFG_ICUUC_SONAME");
     let icui18n_soname = env_opt("EDIT_CFG_ICUI18N_SONAME");
     let cpp_exports = env_opt("EDIT_CFG_ICU_CPP_EXPORTS");
@@ -78,25 +103,21 @@ fn main() {
     if renaming_auto_detect {
         println!("cargo::rustc-cfg=edit_icu_renaming_auto_detect");
     }
-
-    #[cfg(windows)]
-    if target_os == TargetOs::Windows {
-        winresource::WindowsResource::new()
-            .set_manifest_file("src/bin/edit/edit.exe.manifest")
-            .set("FileDescription", "Microsoft Edit")
-            .set("LegalCopyright", "© Microsoft Corporation. All rights reserved.")
-            .set_icon("assets/edit.ico")
-            .compile()
-            .unwrap();
-    }
 }
 
-fn env_opt(name: &str) -> String {
-    match std::env::var(name) {
-        Ok(value) => value,
-        Err(VarError::NotPresent) => String::new(),
-        Err(VarError::NotUnicode(_)) => {
-            panic!("Environment variable `{name}` is not valid Unicode")
-        }
+#[cfg(windows)]
+fn configure_windows_binary(target_os: TargetOs) {
+    if target_os != TargetOs::Windows {
+        return;
     }
+
+    const PATH: &str = "src/bin/edit/edit.exe.manifest";
+    println!("cargo::rerun-if-changed={PATH}");
+    winresource::WindowsResource::new()
+        .set_manifest_file(PATH)
+        .set("FileDescription", "Microsoft Edit")
+        .set("LegalCopyright", "© Microsoft Corporation. All rights reserved.")
+        .set_icon("assets/edit.ico")
+        .compile()
+        .unwrap();
 }

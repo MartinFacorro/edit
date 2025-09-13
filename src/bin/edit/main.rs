@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![feature(allocator_api, let_chains, linked_list_cursors, string_from_utf8_lossy_owned)]
+#![feature(allocator_api, linked_list_cursors, string_from_utf8_lossy_owned)]
 
 mod documents;
 mod draw_editor;
@@ -26,7 +26,7 @@ use edit::arena::{self, Arena, ArenaString, scratch_arena};
 use edit::framebuffer::{self, IndexedColor};
 use edit::helpers::{CoordType, KIBI, MEBI, MetricFormatter, Rect, Size};
 use edit::input::{self, kbmod, vk};
-use edit::oklab::oklab_blend;
+use edit::oklab::StraightRgba;
 use edit::tui::*;
 use edit::vt::{self, Token};
 use edit::{apperr, arena_format, base64, path, sys, unicode};
@@ -51,7 +51,7 @@ fn main() -> process::ExitCode {
     match run() {
         Ok(()) => process::ExitCode::SUCCESS,
         Err(err) => {
-            sys::write_stdout(&format!("{}\r\n", FormatApperr::from(err)));
+            sys::write_stdout(&format!("{}\n", FormatApperr::from(err)));
             process::ExitCode::FAILURE
         }
     }
@@ -59,7 +59,7 @@ fn main() -> process::ExitCode {
 
 fn run() -> apperr::Result<()> {
     // Init `sys` first, as everything else may depend on its functionality (IO, function pointers, etc.).
-    let _sys_deinit = sys::init()?;
+    let _sys_deinit = sys::init();
     // Next init `arena`, so that `scratch_arena` works. `loc` depends on it.
     arena::init(SCRATCH_ARENA_CAPACITY)?;
     // Init the `loc` module, so that error messages are localized.
@@ -70,10 +70,11 @@ fn run() -> apperr::Result<()> {
         return Ok(());
     }
 
-    // sys::init() will switch the terminal to raw mode which prevents the user from pressing Ctrl+C.
-    // Since the `read_file` call may hang for some reason, we must only call this afterwards.
-    // `set_modes()` will enable mouse mode which is equally annoying to switch out for users
-    // and so we do it afterwards, for similar reasons.
+    // This will reopen stdin if it's redirected (which may fail) and switch
+    // the terminal to raw mode which prevents the user from pressing Ctrl+C.
+    // `handle_args` may want to print a help message (must not fail),
+    // and reads files (may hang; should be cancelable with Ctrl+C).
+    // As such, we call this after `handle_args`.
     sys::switch_modes()?;
 
     let mut vt_parser = vt::Parser::new();
@@ -82,15 +83,15 @@ fn run() -> apperr::Result<()> {
 
     let _restore = setup_terminal(&mut tui, &mut state, &mut vt_parser);
 
-    state.menubar_color_bg = oklab_blend(
-        tui.indexed(IndexedColor::Background),
-        tui.indexed_alpha(IndexedColor::BrightBlue, 1, 2),
-    );
+    state.menubar_color_bg = tui.indexed(IndexedColor::Background).oklab_blend(tui.indexed_alpha(
+        IndexedColor::BrightBlue,
+        1,
+        2,
+    ));
     state.menubar_color_fg = tui.contrasted(state.menubar_color_bg);
-    let floater_bg = oklab_blend(
-        tui.indexed_alpha(IndexedColor::Background, 2, 3),
-        tui.indexed_alpha(IndexedColor::Foreground, 1, 3),
-    );
+    let floater_bg = tui
+        .indexed_alpha(IndexedColor::Background, 2, 3)
+        .oklab_blend(tui.indexed_alpha(IndexedColor::Foreground, 1, 3));
     let floater_fg = tui.contrasted(floater_bg);
     tui.setup_modifier_translations(ModifierTranslations {
         ctrl: loc(LocId::Ctrl),
@@ -224,32 +225,43 @@ fn run() -> apperr::Result<()> {
 fn handle_args(state: &mut State) -> apperr::Result<bool> {
     let scratch = scratch_arena(None);
     let mut paths: Vec<PathBuf, &Arena> = Vec::new_in(&*scratch);
-    let mut cwd = env::current_dir()?;
+    let cwd = env::current_dir()?;
+    let mut dir = None;
+    let mut parse_args = true;
 
     // The best CLI argument parser in the world.
     for arg in env::args_os().skip(1) {
-        if arg == "-h" || arg == "--help" || (cfg!(windows) && arg == "/?") {
-            print_help();
-            return Ok(true);
-        } else if arg == "-v" || arg == "--version" {
-            print_version();
-            return Ok(true);
-        } else if arg == "-" {
-            paths.clear();
-            break;
+        if parse_args {
+            if arg == "--" {
+                parse_args = false;
+                continue;
+            }
+            if arg == "-" {
+                paths.clear();
+                break;
+            }
+            if arg == "-h" || arg == "--help" || (cfg!(windows) && arg == "/?") {
+                print_help();
+                return Ok(true);
+            }
+            if arg == "-v" || arg == "--version" {
+                print_version();
+                return Ok(true);
+            }
         }
+
         let p = cwd.join(Path::new(&arg));
         let p = path::normalize(&p);
-        if !p.is_dir() {
+        if p.is_dir() {
+            state.wants_file_picker = StateFilePicker::Open;
+            dir = Some(p);
+        } else {
             paths.push(p);
         }
     }
 
     for p in &paths {
         state.documents.add_file_path(p)?;
-    }
-    if let Some(parent) = paths.first().and_then(|p| p.parent()) {
-        cwd = parent.to_path_buf();
     }
 
     if let Some(mut file) = sys::open_stdin_if_redirected() {
@@ -262,24 +274,30 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
         state.documents.add_untitled()?;
     }
 
-    state.file_picker_pending_dir = DisplayablePathBuf::from_path(cwd);
+    if dir.is_none()
+        && let Some(parent) = paths.last().and_then(|p| p.parent())
+    {
+        dir = Some(parent.to_path_buf());
+    }
+
+    state.file_picker_pending_dir = DisplayablePathBuf::from_path(dir.unwrap_or(cwd));
     Ok(false)
 }
 
 fn print_help() {
     sys::write_stdout(concat!(
-        "Usage: edit [OPTIONS] [FILE[:LINE[:COLUMN]]]\r\n",
-        "Options:\r\n",
-        "    -h, --help       Print this help message\r\n",
-        "    -v, --version    Print the version number\r\n",
-        "\r\n",
-        "Arguments:\r\n",
-        "    FILE[:LINE[:COLUMN]]    The file to open, optionally with line and column (e.g., foo.txt:123:45)\r\n",
+        "Usage: edit [OPTIONS] [FILE[:LINE[:COLUMN]]]\n",
+        "Options:\n",
+        "    -h, --help       Print this help message\n",
+        "    -v, --version    Print the version number\n",
+        "\n",
+        "Arguments:\n",
+        "    FILE[:LINE[:COLUMN]]    The file to open, optionally with line and column (e.g., foo.txt:123:45)\n",
     ));
 }
 
 fn print_version() {
-    sys::write_stdout(concat!("edit version ", env!("CARGO_PKG_VERSION"), "\r\n"));
+    sys::write_stdout(concat!("edit version ", env!("CARGO_PKG_VERSION"), "\n"));
 }
 
 fn draw(ctx: &mut Context, state: &mut State) {
@@ -619,7 +637,7 @@ fn setup_terminal(tui: &mut Tui, state: &mut State, vt_parser: &mut vt::Parser) 
                         }
                     }
 
-                    *color = rgb | 0xff000000;
+                    *color = StraightRgba::from_le(rgb | 0xff000000);
                     color_responses += 1;
                     osc_buffer.clear();
                 }

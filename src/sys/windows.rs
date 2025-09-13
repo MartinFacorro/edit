@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull, null, null_mut};
 use std::{mem, time};
 
+use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows_sys::Win32::Storage::FileSystem;
 use windows_sys::Win32::System::Diagnostics::Debug;
 use windows_sys::Win32::System::{Console, IO, LibraryLoader, Memory, Threading};
@@ -71,6 +72,9 @@ const CONSOLE_READ_NOWAIT: u16 = 0x0002;
 
 const INVALID_CONSOLE_MODE: u32 = u32::MAX;
 
+// Locally-defined error codes follow the HRESULT format, but they have bit 29 set to indicate that they are Customer error codes.
+const ERROR_UNSUPPORTED_LEGACY_CONSOLE: u32 = 0xE0010001;
+
 struct State {
     read_console_input_ex: ReadConsoleInputExW,
     stdin: Foundation::HANDLE,
@@ -106,19 +110,43 @@ extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> Foundation::BOOL {
 }
 
 /// Initializes the platform-specific state.
-pub fn init() -> apperr::Result<Deinit> {
+pub fn init() -> Deinit {
     unsafe {
         // Get the stdin and stdout handles first, so that if this function fails,
         // we at least got something to use for `write_stdout`.
         STATE.stdin = Console::GetStdHandle(Console::STD_INPUT_HANDLE);
         STATE.stdout = Console::GetStdHandle(Console::STD_OUTPUT_HANDLE);
 
+        Deinit
+    }
+}
+
+/// Switches the terminal into raw mode, etc.
+pub fn switch_modes() -> apperr::Result<()> {
+    unsafe {
+        // `kernel32.dll` doesn't exist on OneCore variants of Windows.
+        // NOTE: `kernelbase.dll` is NOT a stable API to rely on. In our case it's the best option though.
+        //
+        // This is written as two nested `match` statements so that we can return the error from the first
+        // `load_read_func` call if it fails. The kernel32.dll lookup may contain some valid information,
+        // while the kernelbase.dll lookup may not, since it's not a stable API.
+        unsafe fn load_read_func(module: *const u16) -> apperr::Result<ReadConsoleInputExW> {
+            unsafe {
+                get_module(module)
+                    .and_then(|m| get_proc_address(m, c"ReadConsoleInputExW".as_ptr()))
+            }
+        }
+        STATE.read_console_input_ex = match load_read_func(w!("kernel32.dll")) {
+            Ok(func) => func,
+            Err(err) => match load_read_func(w!("kernelbase.dll")) {
+                Ok(func) => func,
+                Err(_) => return Err(err),
+            },
+        };
+
         // Reopen stdin if it's redirected (= piped input).
-        if !ptr::eq(STATE.stdin, Foundation::INVALID_HANDLE_VALUE)
-            && matches!(
-                FileSystem::GetFileType(STATE.stdin),
-                FileSystem::FILE_TYPE_DISK | FileSystem::FILE_TYPE_PIPE
-            )
+        if ptr::eq(STATE.stdin, Foundation::INVALID_HANDLE_VALUE)
+            || !matches!(FileSystem::GetFileType(STATE.stdin), FileSystem::FILE_TYPE_CHAR)
         {
             STATE.stdin = FileSystem::CreateFileW(
                 w!("CONIN$"),
@@ -130,35 +158,43 @@ pub fn init() -> apperr::Result<Deinit> {
                 null_mut(),
             );
         }
-
         if ptr::eq(STATE.stdin, Foundation::INVALID_HANDLE_VALUE)
             || ptr::eq(STATE.stdout, Foundation::INVALID_HANDLE_VALUE)
         {
             return Err(get_last_error());
         }
 
-        unsafe fn load_read_func(module: *const u16) -> apperr::Result<ReadConsoleInputExW> {
-            unsafe {
-                get_module(module)
-                    .and_then(|m| get_proc_address(m, c"ReadConsoleInputExW".as_ptr()))
+        check_bool_return(Console::GetConsoleMode(STATE.stdin, &raw mut STATE.stdin_mode_old))?;
+        check_bool_return(Console::GetConsoleMode(STATE.stdout, &raw mut STATE.stdout_mode_old))?;
+
+        match check_bool_return(Console::SetConsoleMode(
+            STATE.stdin,
+            Console::ENABLE_WINDOW_INPUT
+                | Console::ENABLE_EXTENDED_FLAGS
+                | Console::ENABLE_VIRTUAL_TERMINAL_INPUT,
+        )) {
+            Err(e) if e == gle_to_apperr(ERROR_INVALID_PARAMETER) => {
+                Err(apperr::Error::Sys(ERROR_UNSUPPORTED_LEGACY_CONSOLE))
             }
-        }
+            other => other,
+        }?;
+        check_bool_return(Console::SetConsoleMode(
+            STATE.stdout,
+            Console::ENABLE_PROCESSED_OUTPUT
+                | Console::ENABLE_WRAP_AT_EOL_OUTPUT
+                | Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | Console::DISABLE_NEWLINE_AUTO_RETURN,
+        ))?;
 
-        // `kernel32.dll` doesn't exist on OneCore variants of Windows.
-        // NOTE: `kernelbase.dll` is NOT a stable API to rely on. In our case it's the best option though.
-        //
-        // This is written as two nested `match` statements so that we can return the error from the first
-        // `load_read_func` call if it fails. The kernel32.dll lookup may contain some valid information,
-        // while the kernelbase.dll lookup may not, since it's not a stable API.
-        STATE.read_console_input_ex = match load_read_func(w!("kernel32.dll")) {
-            Ok(func) => func,
-            Err(err) => match load_read_func(w!("kernelbase.dll")) {
-                Ok(func) => func,
-                Err(_) => return Err(err),
-            },
-        };
+        check_bool_return(Console::SetConsoleCtrlHandler(Some(console_ctrl_handler), 1))?;
 
-        Ok(Deinit)
+        STATE.stdin_cp_old = Console::GetConsoleCP();
+        STATE.stdout_cp_old = Console::GetConsoleOutputCP();
+
+        check_bool_return(Console::SetConsoleCP(Globalization::CP_UTF8))?;
+        check_bool_return(Console::SetConsoleOutputCP(Globalization::CP_UTF8))?;
+
+        Ok(())
     }
 }
 
@@ -184,36 +220,6 @@ impl Drop for Deinit {
                 STATE.stdout_mode_old = INVALID_CONSOLE_MODE;
             }
         }
-    }
-}
-
-/// Switches the terminal into raw mode, etc.
-pub fn switch_modes() -> apperr::Result<()> {
-    unsafe {
-        check_bool_return(Console::SetConsoleCtrlHandler(Some(console_ctrl_handler), 1))?;
-
-        STATE.stdin_cp_old = Console::GetConsoleCP();
-        STATE.stdout_cp_old = Console::GetConsoleOutputCP();
-        check_bool_return(Console::GetConsoleMode(STATE.stdin, &raw mut STATE.stdin_mode_old))?;
-        check_bool_return(Console::GetConsoleMode(STATE.stdout, &raw mut STATE.stdout_mode_old))?;
-
-        check_bool_return(Console::SetConsoleCP(Globalization::CP_UTF8))?;
-        check_bool_return(Console::SetConsoleOutputCP(Globalization::CP_UTF8))?;
-        check_bool_return(Console::SetConsoleMode(
-            STATE.stdin,
-            Console::ENABLE_WINDOW_INPUT
-                | Console::ENABLE_EXTENDED_FLAGS
-                | Console::ENABLE_VIRTUAL_TERMINAL_INPUT,
-        ))?;
-        check_bool_return(Console::SetConsoleMode(
-            STATE.stdout,
-            Console::ENABLE_PROCESSED_OUTPUT
-                | Console::ENABLE_WRAP_AT_EOL_OUTPUT
-                | Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                | Console::DISABLE_NEWLINE_AUTO_RETURN,
-        ))?;
-
-        Ok(())
     }
 }
 
@@ -729,31 +735,36 @@ pub(crate) fn io_error_to_apperr(err: std::io::Error) -> apperr::Error {
 
 /// Formats a platform error code into a human-readable string.
 pub fn apperr_format(f: &mut std::fmt::Formatter<'_>, code: u32) -> std::fmt::Result {
-    unsafe {
-        let mut ptr: *mut u8 = null_mut();
-        let len = Debug::FormatMessageA(
-            Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
-                | Debug::FORMAT_MESSAGE_FROM_SYSTEM
-                | Debug::FORMAT_MESSAGE_IGNORE_INSERTS,
-            null(),
-            code,
-            0,
-            &mut ptr as *mut *mut _ as *mut _,
-            0,
-            null_mut(),
-        );
-
-        write!(f, "Error {code:#08x}")?;
-
-        if len > 0 {
-            let msg = str_from_raw_parts(ptr, len as usize);
-            let msg = msg.trim_ascii();
-            let msg = msg.replace(['\r', '\n'], " ");
-            write!(f, ": {msg}")?;
-            Foundation::LocalFree(ptr as *mut _);
+    match code {
+        ERROR_UNSUPPORTED_LEGACY_CONSOLE => {
+            write!(f, "This application does not support the legacy console.")
         }
+        _ => unsafe {
+            let mut ptr: *mut u8 = null_mut();
+            let len = Debug::FormatMessageA(
+                Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER
+                    | Debug::FORMAT_MESSAGE_FROM_SYSTEM
+                    | Debug::FORMAT_MESSAGE_IGNORE_INSERTS,
+                null(),
+                code,
+                0,
+                &mut ptr as *mut *mut _ as *mut _,
+                0,
+                null_mut(),
+            );
 
-        Ok(())
+            write!(f, "Error {code:#08x}")?;
+
+            if len > 0 {
+                let msg = str_from_raw_parts(ptr, len as usize);
+                let msg = msg.trim_ascii();
+                let msg = msg.replace(['\r', '\n'], " ");
+                write!(f, ": {msg}")?;
+                Foundation::LocalFree(ptr as *mut _);
+            }
+
+            Ok(())
+        },
     }
 }
 
