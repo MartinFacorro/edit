@@ -6,6 +6,8 @@
 pub mod alloc;
 pub mod arena;
 pub mod collections;
+pub mod float;
+pub mod glob;
 mod helpers;
 pub mod simd;
 pub mod sys;
